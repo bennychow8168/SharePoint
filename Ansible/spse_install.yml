@@ -1,0 +1,125 @@
+---
+- name: Install SharePoint Subscription Edition On-Premises
+  hosts: sharepoint_servers
+  gather_facts: yes
+  vars:
+    # Set your preloaded media paths here
+    sp_media_path: "C:\\InstallMedia\\SharePoint"
+    jp_lp_path: "C:\\InstallMedia\\LanguagePacks\\Japanese"
+    cu_path: "C:\\InstallMedia\\Updates\\Feb2026CU"
+    cu_exe_name: "feb2026-cu-spse-kbXXXXXXX-x64.exe" # Replace with exact executable name
+    sp_config_file: "C:\\InstallMedia\\SharePoint\\config.xml" # Auto-install config file
+    lp_config_file: "C:\\InstallMedia\\LanguagePacks\\Japanese\\config.xml"
+
+  tasks:
+    # 1. Set Temp Folder to T:\Temp
+    - name: Ensure T:\Temp directory exists
+      ansible.windows.win_file:
+        path: T:\Temp
+        state: directory
+
+    - name: Set System TEMP and TMP environment variables
+      ansible.windows.win_environment:
+        name: "{{ item }}"
+        value: T:\Temp
+        level: machine
+        state: present
+      loop:
+        - TEMP
+        - TMP
+
+    # 2. Set Page File to P:\
+    - name: Configure Page File on P:\ and disable C:\ automatic management
+      ansible.windows.win_shell: |
+        $cs = Get-CimInstance Win32_ComputerSystem
+        if ($cs.AutomaticManagedPagefile) {
+            $cs.AutomaticManagedPagefile = $False
+            Set-CimInstance $cs
+        }
+        
+        # Remove existing pagefile on C:
+        $existing_pf = Get-CimInstance Win32_PageFileSetting -Filter "Name='C:\\pagefile.sys'"
+        if ($existing_pf) { Remove-CimInstance $existing_pf }
+        
+        # Create new pagefile on P: (Example sets it to 16GB, adjust as needed for SP)
+        $p_pf = Get-CimInstance Win32_PageFileSetting -Filter "Name='P:\\pagefile.sys'"
+        if (-not $p_pf) {
+            New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name="P:\pagefile.sys"; InitialSize=16384; MaximumSize=16384}
+        }
+      register: pagefile_setup
+
+    - name: Reboot after page file change if required
+      ansible.windows.win_reboot:
+      when: pagefile_setup.changed
+
+    # 3. Install IIS and core Web Server features
+    - name: Install IIS and required Windows Features
+      ansible.windows.win_feature:
+        name:
+          - Web-Server
+          - Web-Mgmt-Tools
+          - Application-Server
+          - NET-Framework-45-ASPNET
+        state: present
+        include_management_tools: yes
+        include_sub_features: yes
+      register: iis_install
+
+    - name: Reboot after IIS install if required
+      ansible.windows.win_reboot:
+      when: iis_install.reboot_required
+
+    # 4. Install Prerequisites from preloaded location
+    # Note: Using /unattended. If you have offline prereq files, you may need to pass specific /component_name paths.
+    - name: Install SharePoint Prerequisites
+      ansible.windows.win_command: >
+        {{ sp_media_path }}\prerequisiteinstaller.exe /unattended
+      args:
+        chdir: "{{ sp_media_path }}"
+      register: prereq_install
+      # Prerequisite installer returns 0 on success, 3010 on success requiring reboot
+      failed_when: prereq_install.rc not in [0, 3010]
+
+    - name: Reboot after Prerequisites installation
+      ansible.windows.win_reboot:
+      when: prereq_install.rc == 3010 or prereq_install.changed
+
+    # 5. Execute initial SharePoint App Setup
+    - name: Install SharePoint Subscription Edition
+      ansible.windows.win_command: >
+        {{ sp_media_path }}\setup.exe /config {{ sp_config_file }}
+      args:
+        chdir: "{{ sp_media_path }}"
+      register: sp_install
+      failed_when: sp_install.rc not in [0, 3010]
+
+    - name: Reboot after SharePoint Base Installation
+      ansible.windows.win_reboot:
+      when: sp_install.rc == 3010 or sp_install.changed
+
+    # 6. Install Japanese Language Pack
+    - name: Install Japanese Language Pack
+      ansible.windows.win_command: >
+        {{ jp_lp_path }}\setup.exe /config {{ lp_config_file }}
+      args:
+        chdir: "{{ jp_lp_path }}"
+      register: jp_lp_install
+      failed_when: jp_lp_install.rc not in [0, 3010]
+
+    - name: Reboot after Language Pack Installation
+      ansible.windows.win_reboot:
+      when: jp_lp_install.rc == 3010 or jp_lp_install.changed
+
+    # 7. Install Feb 2026 Cumulative Update (CU)
+    - name: Install Feb 2026 CU
+      ansible.windows.win_command: >
+        {{ cu_path }}\{{ cu_exe_name }} /quiet /norestart
+      args:
+        chdir: "{{ cu_path }}"
+      register: cu_install
+      failed_when: cu_install.rc not in [0, 3010, 1641]
+
+    - name: Final Reboot after CU installation
+      ansible.windows.win_reboot:
+      when: cu_install.rc in [3010, 1641] or cu_install.changed
+...

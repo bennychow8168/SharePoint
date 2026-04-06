@@ -1,0 +1,3 @@
+pagefile_drive: "P:"
+pagefile_initial_size: 8192
+pagefile_maximum_size: 16384

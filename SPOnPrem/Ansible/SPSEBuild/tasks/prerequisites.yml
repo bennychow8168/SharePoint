@@ -1,0 +1,45 @@
+---
+- name: Install required Windows features for SharePoint
+  win_feature:
+    name: "{{ item }}"
+    state: present
+  loop:
+    - NET-Framework-Features
+    - NET-Framework-45-Features
+    - Web-Server
+    - Web-WebServer
+    - Web-Common-Http
+    # ...add all required Windows roles/features here
+  register: win_feature_install
+
+- name: Install Visual C++ Redistributable and other prerequisites
+  win_package:
+    path: "C:\\Installers\\vc_redist.x64.exe"
+    arguments: /install /quiet /norestart
+    state: present
+
+- name: Install .NET Framework 4.8
+  win_feature:
+    name: "NET-Framework-48"
+    state: present
+
+- name: Run SharePoint prerequisiteinstaller.exe (unattended)
+  win_command: >
+    "{{ mount_path }}\\prerequisiteinstaller.exe /unattended /config "C:\Installers\PrerequisiteInstaller.Arguments.txt"
+  args:
+    chdir: "{{ mount_path }}"
+  register: prereq_result
+  ignore_errors: yes
+
+- name: Reboot if prereqs require it
+  win_reboot:
+    reboot_timeout: 3600
+  when: prereq_result.rc != 0 and "'reboot'" in prereq_result.stdout|lower
+
+- name: Continue prerequisite installation after reboot if needed
+  win_command: >
+    "{{ mount_path }}\\prerequisiteinstaller.exe /continue /unattended" /config "C:\Installers\PrerequisiteInstaller.Arguments.txt"
+  args:
+    chdir: "{{ mount_path }}"
+  when: prereq_result.rc != 0 and "'reboot'" in prereq_result.stdout|lower
+...

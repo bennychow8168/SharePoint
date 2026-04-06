@@ -1,0 +1,130 @@
+---
+
+- name: Create Binaries Directory
+  win_file:
+    path: D:\Binaries
+    state: directory
+
+- name: Create New Temp Directory
+  win_file:
+    path: T:\Temp
+    state: directory
+
+- name: Create SPLogs Directory
+  win_file:
+    path: L:\SPLogs
+    state: directory
+
+- name: Set New Temp folder permissions
+  win_shell:
+    $sourceAcl = Get-Acl "C:\Windows\Temp"
+    Set-Acl "T:\Temp" $sourceAcl
+
+- name: Set New Temp folder permissions
+  win_acl:
+    path: T:\Temp
+    user: 'CREATOR OWNER'
+    rights: FullControl
+    type: allow
+    state: present
+
+- name: Set New Temp folder permissions
+  win_acl:
+    path: T:\Temp
+    user: 'NT AUTHORITY\SYSTEM'
+    rights: FullControl
+    type: allow
+    state: present
+
+- name: Set New Temp folder permissions
+  win_acl:
+    path: T:\Temp
+    user: BUILTIN\Administrators
+    rights: FullControl
+    type: allow
+    state: present
+
+- name: Set New Temp folder permissions
+  win_acl:
+    path: T:\Temp
+    user: BUILTIN\Users
+    rights: CreateFiles,AppendData,ExecuteFile,Synchronize
+    type: allow
+    state: present
+
+- name: Set New Temp to Environment Variable
+  win_environment:
+    state: present
+    name: Temp
+    level: machine
+    value: T:\Temp
+
+- name: Set New Temp to Environment Variable
+  win_environment:
+    state: present
+    name: Tmp
+    level: machine
+    value: T:\Temp
+
+- name: get new page file size
+  win_shell:
+    $newsize = ((Get-CimInstance Win32_PhysicalMemory | Measure-Object -Property capacity -Sum).sum /1mb)*1.5
+  register:
+    newsize
+
+- name: Set pagefile in P drive
+  win_pagefile:
+    drive: p
+    Initial_size: newsize
+    maximum_size: newsize
+    state: present
+
+- name: Remove pagefile from C drive
+  win_pagefile:
+    drive: C
+    state: absent
+
+- name: Reboot after Set P drive pagefile
+  win_reboot:
+
+- name: Install All Required Windows Features
+  win_feature:
+    name: NET-WCF-Pipe-Activation45,NET-WCF-HTTP-Activation45,NET-WCF-TCP-Activation45,Web-Server,Web-WebServer,Web-Common-Http,Web-Static-Content,Web-Default-Doc,Web-Dir-Browsing,Web-Http-Errors,Web-App-Dev,Web-Asp-Net45,Web-Net-Ext45,Web-ISAPI-Ext,Web-ISAPI-Filter,Web-Health,Web-Http-Logging,Web-Log-Libraries,Web-Request-Monitor,Web-Http-Tracing,Web-Security,Web-Basic-Auth,Web-Windows-Auth,Web-Filtering,Web-Performance,Web-Stat-Compression,Web-Dyn-Compression,WAS,WAS-Process-Model,WAS-Config-APIs -IncludeManagementTools
+    state: present
+    restart: yes
+    include_sub_features: yes
+    include_management_tools: yes
+  register: feature_result
+
+# make sure to put the prerequisites in the proper folder.
+- name: Retrieve SharePoint Prerequisites
+  script: ../../common/files/DownloadPrerequisites.ps1 -SPPrerequisitesPath {{SharePointPrerequisitesPath}}
+
+- name: Retrieve SE binary
+  win_get_url:
+    url: http://www.example.com/earthrise.jpg
+    dest: d:\binaries\spse.zip
+
+- name: Retrieve SE language pack binary
+  win_get_url:
+    url: http://www.example.com/earthrise.jpg
+    dest: d:\binaries\spselang.zip
+
+- name: Retrieve autoinstaller binary
+  win_get_url:
+    url: http://www.example.com/earthrise.jpg
+    dest: d:\binaries\autoinstaller.zip
+
+- name:  Install SharePoint Prerequisites
+  script: ../../common/files/Install-Prerequisites.ps1 -SharePointBitsPath {{SharePointBitsPath}}
+
+- name: Reboot after Installing Prerequisites
+  win_reboot:
+
+# Install prerequisites.
+- name: Install prerequisites.
+  win_cmd: ..\prerequisiteinstaller.exe /unattended /MSVCRT142:<file> /DotNet48:<file> /WindowsSource:<path>
+
+
+
+...

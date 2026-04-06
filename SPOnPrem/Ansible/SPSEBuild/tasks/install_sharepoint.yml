@@ -1,0 +1,20 @@
+---
+- name: Mount SharePoint ISO
+  win_disk_image:
+    image_path: "{{ sharepoint_iso_path }}"
+    state: present
+
+- name: Run SharePoint prerequisiteinstaller.exe
+  win_command: "{{ mount_path }}\\prerequisiteinstaller.exe /unattended"
+  args:
+    chdir: "{{ mount_path }}"
+
+- name: Run SharePoint setup
+  win_command: >
+    {{ mount_path }}\\setup.exe 
+    /config "{{ sharepoint_config_file }}"
+    /installpath "{{ sharepoint_install_path }}"
+  args:
+    chdir: "{{ mount_path }}"
+
+...

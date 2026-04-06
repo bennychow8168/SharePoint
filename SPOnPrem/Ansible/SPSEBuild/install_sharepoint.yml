@@ -1,0 +1,53 @@
+---
+- name: Install SharePoint Subscription Edition (Full, Offline)
+  hosts: sharepoint_servers
+  vars_files:
+    - vars/sharepoint.yml
+    - vars/pagefile.yml
+    - vars/environment.yml
+
+  tasks:
+    - name: Ensure Windows prerequisites (features) are installed
+      import_tasks: tasks/prerequisites.yml
+
+    - name: Configure page file on P drive
+      import_tasks: tasks/configure_pagefile.yml
+
+    - name: Set System TEMP folder to T:\Temp
+      import_tasks: tasks/configure_temp.yml
+
+    - name: Copy all prerequisite binaries to node
+      win_copy:
+        src: files/
+        dest: '{{ prereq_dest }}'
+      vars:
+        prereq_dest: C:\Installers\prereqs
+
+    - name: Copy PrerequisiteInstaller.Arguments.txt to node
+      win_copy:
+        src: files/PrerequisiteInstaller.Arguments.txt
+        dest: '{{ prereq_dest }}\PrerequisiteInstaller.Arguments.txt'
+
+    - name: Mount SharePoint ISO
+      win_disk_image:
+        image_path: "{{ sharepoint_iso_path }}"
+        state: present
+      register: iso_mount
+
+    - name: Run SharePoint prerequisite installer with binaries
+      win_command: >
+        "{{ iso_mount.mount_paths }}\PrerequisiteInstaller.exe"
+        /unattended
+        /config "{{ prereq_dest }}\PrerequisiteInstaller.Arguments.txt"
+      register: prereq_result
+      ignore_errors: yes
+
+    - name: Reboot if prerequisites require it
+      win_reboot:
+        reboot_timeout: 3600
+      when: prereq_result.rc == 3010
+
+    - name: Install SharePoint to D:\ drive
+      import_tasks: tasks/install_sharepoint.yml
+
+...

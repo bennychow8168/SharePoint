@@ -1,0 +1,10 @@
+---
+- name: Ensure pagefile exists on P drive
+  community.windows.win_pagefile:
+    drive: "{{ pagefile_drive }}"
+    initial_size: "{{ pagefile_initial_size }}"
+    maximum_size: "{{ pagefile_maximum_size }}"
+    override: yes
+    state: present
+
+...

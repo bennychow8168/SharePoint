@@ -1,0 +1,15 @@
+---
+- name: Set System TEMP environment variable
+  win_environment:
+    state: present
+    name: TEMP
+    value: "{{ temp_folder }}"
+    level: machine
+
+- name: Set System TMP environment variable
+  win_environment:
+    state: present
+    name: TMP
+    value: "{{ temp_folder }}"
+    level: machine
+...

@@ -1,0 +1,7 @@
+sharepoint_iso_path: "D:\\Installers\\SharePointSE.iso"
+sharepoint_install_path: "D:\\SharePoint"
+sharepoint_config_file: "D:\\Installers\\config.xml"
+sharepoint_service_accounts:
+  farm: "DOMAIN\\spfarm"
+  setup: "DOMAIN\\spsetup"
+  db: "DOMAIN\\spdb"

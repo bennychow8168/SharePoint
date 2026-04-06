@@ -1,0 +1,365 @@
+---
+###############################################################################
+# Ansible Playbook: SharePoint Subscription Edition – On-Premises Installation
+# Target OS : Windows Server 2019 / 2022
+# Ansible    : 2.14+ with ansible.windows / community.windows collections
+###############################################################################
+
+- name: SharePoint Subscription Edition – Full Server Preparation & Installation
+  hosts: sharepoint_servers
+  gather_facts: true
+  vars:
+    # ── Paths ────────────────────────────────────────────────────────────────
+    sp_prereq_dir:    'C:\SPInstall\Prerequisites'   # preloaded prerequisites
+    sp_install_dir:   'C:\SPInstall\SharePoint'       # preloaded SP media
+    sp_langpack_dir:  'C:\SPInstall\LanguagePacks'    # preloaded language packs
+    sp_cu_dir:        'C:\SPInstall\CU'               # preloaded CU patches
+    temp_drive:       'T:'
+    temp_path:        'T:\Temp'
+    pagefile_drive:   'P:'
+    pagefile_path:    'P:\pagefile.sys'
+    pagefile_init_mb: 8192
+    pagefile_max_mb:  16384
+
+    # ── SharePoint unattended config file ────────────────────────────────────
+    sp_config_xml:    'C:\SPInstall\SharePoint\config.xml'
+
+    # ── SharePoint Feb 2026 CU – adjust filename when known ─────────────────
+    sp_cu_feb2026:    'sts-subscription-kb5002699-fullfile-x64-glb.exe'
+
+  tasks:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1 – TEMP FOLDER
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "TEMP | Ensure T:\Temp directory exists"
+      ansible.windows.win_file:
+        path: "{{ temp_path }}"
+        state: directory
+
+    - name: "TEMP | Set system TEMP environment variable"
+      ansible.windows.win_environment:
+        name: TEMP
+        value: "{{ temp_path }}"
+        level: machine
+        state: present
+
+    - name: "TEMP | Set system TMP environment variable"
+      ansible.windows.win_environment:
+        name: TMP
+        value: "{{ temp_path }}"
+        level: machine
+        state: present
+
+    - name: "TEMP | Set user-level TEMP environment variable"
+      ansible.windows.win_environment:
+        name: TEMP
+        value: "{{ temp_path }}"
+        level: user
+        state: present
+
+    - name: "TEMP | Set user-level TMP environment variable"
+      ansible.windows.win_environment:
+        name: TMP
+        value: "{{ temp_path }}"
+        level: user
+        state: present
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2 – PAGE FILE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "PAGEFILE | Disable automatic page file management"
+      ansible.windows.win_powershell:
+        script: |
+          $cs = Get-WmiObject -Class Win32_ComputerSystem
+          if ($cs.AutomaticManagedPagefile) {
+            $cs.AutomaticManagedPagefile = $false
+            $cs.Put() | Out-Null
+            Write-Output "changed"
+          } else {
+            Write-Output "ok"
+          }
+      register: pagefile_auto
+      changed_when: "'changed' in pagefile_auto.output"
+
+    - name: "PAGEFILE | Remove any existing page files on other drives"
+      ansible.windows.win_powershell:
+        script: |
+          $existing = Get-WmiObject -Class Win32_PageFileSetting |
+                      Where-Object { $_.Name -notlike '{{ pagefile_drive }}*' }
+          foreach ($pf in $existing) { $pf.Delete() }
+
+    - name: "PAGEFILE | Create / update page file on {{ pagefile_drive }}"
+      community.windows.win_pagefile:
+        drive: "{{ pagefile_drive }}"
+        initial_size: "{{ pagefile_init_mb }}"
+        maximum_size: "{{ pagefile_max_mb }}"
+        override: true
+        state: present
+      register: pagefile_result
+
+    - name: "PAGEFILE | Reboot if page file change requires it"
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 30
+      when: pagefile_result.reboot_required | default(false)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3 – IIS AND WINDOWS FEATURES
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "IIS | Install IIS Web Server role and required sub-features"
+      ansible.windows.win_feature:
+        name:
+          - Web-Server
+          - Web-WebServer
+          - Web-Common-Http
+          - Web-Default-Doc
+          - Web-Dir-Browsing
+          - Web-Http-Errors
+          - Web-Static-Content
+          - Web-Http-Redirect
+          - Web-Health
+          - Web-Http-Logging
+          - Web-Log-Libraries
+          - Web-Request-Monitor
+          - Web-Http-Tracing
+          - Web-Performance
+          - Web-Stat-Compression
+          - Web-Dyn-Compression
+          - Web-Security
+          - Web-Filtering
+          - Web-Basic-Auth
+          - Web-Windows-Auth
+          - Web-Digest-Auth
+          - Web-Client-Auth
+          - Web-Cert-Auth
+          - Web-Url-Auth
+          - Web-IP-Security
+          - Web-App-Dev
+          - Web-Net-Ext
+          - Web-Net-Ext45
+          - Web-Asp-Net
+          - Web-Asp-Net45
+          - Web-ISAPI-Ext
+          - Web-ISAPI-Filter
+          - Web-Mgmt-Tools
+          - Web-Mgmt-Console
+          - Web-Mgmt-Compat
+          - Web-Metabase
+          - Web-WMI
+          - Web-Lgcy-Scripting
+          - Web-Lgcy-Mgmt-Console
+          - NET-Framework-Features
+          - NET-Framework-Core
+          - NET-Framework-45-Features
+          - NET-Framework-45-Core
+          - NET-Framework-45-ASPNET
+          - NET-WCF-Services45
+          - NET-WCF-HTTP-Activation45
+          - NET-WCF-TCP-PortSharing45
+          - WAS
+          - WAS-Process-Model
+          - WAS-NET-Environment
+          - WAS-Config-APIs
+          - Windows-Identity-Foundation
+          - Xps-Viewer
+        state: present
+        include_management_tools: true
+      register: iis_install
+
+    - name: "IIS | Reboot after feature installation if required"
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 30
+      when: iis_install.reboot_required
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 4 – SHAREPOINT PREREQUISITES (offline / preloaded)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "PREREQS | Verify prerequisite installer exists"
+      ansible.windows.win_stat:
+        path: "{{ sp_prereq_dir }}\\prerequisiteinstaller.exe"
+      register: prereq_exe
+
+    - name: "PREREQS | Fail if prerequisite installer not found"
+      ansible.builtin.fail:
+        msg: >
+          prerequisiteinstaller.exe not found at {{ sp_prereq_dir }}.
+          Please stage the SharePoint media to that path before running.
+      when: not prereq_exe.stat.exists
+
+    - name: "PREREQS | Run SharePoint prerequisiteinstaller.exe (offline)"
+      ansible.windows.win_package:
+        path: "{{ sp_prereq_dir }}\\prerequisiteinstaller.exe"
+        arguments: >-
+          /unattended
+          /SQLNCli:{{ sp_prereq_dir }}\sqlncli.msi
+          /Sync:{{ sp_prereq_dir }}\Synchronization.msi
+          /AppFabric:{{ sp_prereq_dir }}\WindowsServerAppFabricSetup_x64.exe
+          /IDFX11:{{ sp_prereq_dir }}\MicrosoftIdentityExtensions-64.msi
+          /MSIPCClient:{{ sp_prereq_dir }}\setup_msipc_x64.exe
+          /WCFDataServices56:{{ sp_prereq_dir }}\WcfDataServices.exe
+          /DotNetFx:{{ sp_prereq_dir }}\NDP462-KB3151800-x86-x64-AllOS-ENU.exe
+          /MSVCRT142:{{ sp_prereq_dir }}\vc_redist.x64.exe
+          /ODBC:{{ sp_prereq_dir }}\msodbcsql.msi
+        state: present
+        expected_return_code: [0, 1001, 3010]
+      register: prereq_result
+
+    - name: "PREREQS | Reboot after prerequisite installation if required"
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 60
+      when: prereq_result.reboot_required | default(prereq_result.rc == 3010)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 5 – SHAREPOINT SUBSCRIPTION EDITION INITIAL SETUP
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "SP SETUP | Verify SharePoint setup.exe exists"
+      ansible.windows.win_stat:
+        path: "{{ sp_install_dir }}\\setup.exe"
+      register: sp_setup_exe
+
+    - name: "SP SETUP | Fail if setup.exe not found"
+      ansible.builtin.fail:
+        msg: >
+          setup.exe not found at {{ sp_install_dir }}.
+          Please stage the SharePoint media to that path before running.
+      when: not sp_setup_exe.stat.exists
+
+    - name: "SP SETUP | Deploy unattended config.xml"
+      ansible.windows.win_copy:
+        content: |
+          <Configuration>
+            <Package Id="sts">
+              <Setting Id="SETUPTYPE" Value="CLEAN_INSTALL"/>
+            </Package>
+            <DATADIR Value="C:\Program Files\Microsoft Office Servers\16.0\Data"/>
+            <Logging Type="verbose" Path="{{ temp_path }}" Template="SharePoint Server Setup(*).log"/>
+            <ARP ARPCOMMENTS="SharePoint Subscription Edition"
+                 ARPCONTACT="IT Operations"/>
+            <Setting Id="SERVERROLE" Value="APPLICATION"/>
+            <Display Level="none" CompletionNotice="no" AcceptEula="yes"/>
+          </Configuration>
+        dest: "{{ sp_config_xml }}"
+
+    - name: "SP SETUP | Execute SharePoint initial installation (unattended)"
+      ansible.windows.win_package:
+        path: "{{ sp_install_dir }}\\setup.exe"
+        arguments: "/config {{ sp_config_xml }}"
+        state: present
+        expected_return_code: [0, 1001, 3010]
+      register: sp_install_result
+
+    - name: "SP SETUP | Reboot after SharePoint installation if required"
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+        post_reboot_delay: 60
+      when: sp_install_result.reboot_required | default(sp_install_result.rc == 3010)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 6 – JAPANESE LANGUAGE PACK
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "LANGPACK | Verify Japanese language pack executable exists"
+      ansible.windows.win_stat:
+        path: "{{ sp_langpack_dir }}\\ServerLanguagePack_16.0_ja-jp.exe"
+      register: ja_lp_exe
+
+    - name: "LANGPACK | Fail if Japanese language pack not found"
+      ansible.builtin.fail:
+        msg: >
+          Japanese language pack not found at {{ sp_langpack_dir }}.
+          Expected filename: ServerLanguagePack_16.0_ja-jp.exe
+      when: not ja_lp_exe.stat.exists
+
+    - name: "LANGPACK | Install SharePoint Japanese language pack (silent)"
+      ansible.windows.win_package:
+        path: "{{ sp_langpack_dir }}\\ServerLanguagePack_16.0_ja-jp.exe"
+        arguments: "/quiet /norestart"
+        state: present
+        expected_return_code: [0, 1001, 3010]
+      register: ja_lp_result
+
+    - name: "LANGPACK | Reboot after language pack installation if required"
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+        post_reboot_delay: 30
+      when: ja_lp_result.reboot_required | default(ja_lp_result.rc == 3010)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 7 – FEBRUARY 2026 CUMULATIVE UPDATE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "CU FEB2026 | Verify Feb 2026 CU package exists"
+      ansible.windows.win_stat:
+        path: "{{ sp_cu_dir }}\\{{ sp_cu_feb2026 }}"
+      register: cu_feb2026_exe
+
+    - name: "CU FEB2026 | Fail if Feb 2026 CU package not found"
+      ansible.builtin.fail:
+        msg: >
+          Feb 2026 CU not found at {{ sp_cu_dir }}\{{ sp_cu_feb2026 }}.
+          Please stage the CU binary before running this playbook.
+      when: not cu_feb2026_exe.stat.exists
+
+    - name: "CU FEB2026 | Apply February 2026 Cumulative Update (silent)"
+      ansible.windows.win_package:
+        path: "{{ sp_cu_dir }}\\{{ sp_cu_feb2026 }}"
+        arguments: "/quiet /norestart /log:{{ temp_path }}\\SP_CU_Feb2026.log"
+        state: present
+        expected_return_code: [0, 1001, 3010]
+      register: cu_feb2026_result
+
+    - name: "CU FEB2026 | Reboot after CU installation if required"
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+        post_reboot_delay: 60
+      when: cu_feb2026_result.reboot_required | default(cu_feb2026_result.rc == 3010)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 8 – POST-INSTALL VALIDATION
+    # ══════════════════════════════════════════════════════════════════════════
+
+    - name: "VALIDATE | Check SharePoint registry key is present"
+      ansible.windows.win_reg_stat:
+        path: HKLM:\SOFTWARE\Microsoft\Shared Tools\Web Server Extensions\16.0
+      register: sp_reg
+
+    - name: "VALIDATE | Confirm SharePoint registry key found"
+      ansible.builtin.debug:
+        msg: "SharePoint Subscription Edition registry key found – installation verified."
+      when: sp_reg.exists
+
+    - name: "VALIDATE | Warn if SharePoint registry key missing"
+      ansible.builtin.fail:
+        msg: >
+          SharePoint registry key not found. The installation may have failed.
+          Check the setup log at {{ temp_path }}.
+      when: not sp_reg.exists
+
+    - name: "VALIDATE | Confirm TEMP path"
+      ansible.windows.win_powershell:
+        script: "[System.Environment]::GetEnvironmentVariable('TEMP','Machine')"
+      register: temp_check
+
+    - name: "VALIDATE | Print current TEMP value"
+      ansible.builtin.debug:
+        msg: "System TEMP is set to: {{ temp_check.output[0] }}"
+
+    - name: "VALIDATE | Confirm page file location"
+      ansible.windows.win_powershell:
+        script: >
+          Get-WmiObject -Class Win32_PageFileSetting |
+          Select-Object Name, InitialSize, MaximumSize | ConvertTo-Json
+      register: pagefile_check
+
+    - name: "VALIDATE | Print page file settings"
+      ansible.builtin.debug:
+        msg: "Page file settings: {{ pagefile_check.output }}"
+,,,
