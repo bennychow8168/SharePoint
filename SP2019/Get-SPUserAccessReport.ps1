@@ -50,8 +50,9 @@ param (
     [switch]$IncludeGroupMembers
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+# NOTE: Do NOT use Set-StrictMode here — it causes ".Count not found" errors
+# on single-item JSON-deserialized objects that are PSCustomObject, not arrays.
+$ErrorActionPreference = 'Continue'
 
 #region -- System account filter ----------------------------------------------
 $SystemAccountPatterns = @(
@@ -81,24 +82,20 @@ function Test-IsSystemAccount {
 }
 #endregion
 
-#region -- REST helpers -------------------------------------------------------
-function New-RestHeaders {
-    return @{
-        'Accept'       = 'application/json;odata=verbose'
-        'Content-Type' = 'application/json;odata=verbose'
-    }
-}
-
+#region -- REST helper --------------------------------------------------------
 function Invoke-SpRestGet {
     param(
         [string]$Url,
-        [hashtable]$Headers,
         [PSCredential]$Cred
     )
+    $headers = @{
+        'Accept'       = 'application/json;odata=verbose'
+        'Content-Type' = 'application/json;odata=verbose'
+    }
     $splat = @{
         Uri             = $Url
         Method          = 'GET'
-        Headers         = $Headers
+        Headers         = $headers
         UseBasicParsing = $true
     }
     if ($Cred) {
@@ -108,20 +105,36 @@ function Invoke-SpRestGet {
     }
     try {
         $resp = Invoke-WebRequest @splat
-        return ($resp.Content | ConvertFrom-Json).d
+        $parsed = $resp.Content | ConvertFrom-Json
+        return $parsed.d
     }
     catch {
         $code = $null
-        if ($_.Exception.Response) { $code = $_.Exception.Response.StatusCode.value__ }
-        Write-Warning "  [HTTP $code] $Url`n  $_"
+        try { $code = $_.Exception.Response.StatusCode.value__ } catch {}
+        Write-Warning "[HTTP $code] Failed: $Url`n  $($_.Exception.Message)"
         return $null
     }
 }
 #endregion
 
+#region -- Safe array helper --------------------------------------------------
+# Always returns a real PowerShell array, never $null, never a bare object
+function ConvertTo-Array {
+    param($InputObject)
+    if ($null -eq $InputObject) { return @() }
+    # Already an array or list
+    if ($InputObject -is [System.Array] -or
+        $InputObject -is [System.Collections.IList]) {
+        return @($InputObject)
+    }
+    # Single object — wrap it
+    return @($InputObject)
+}
+#endregion
+
 #region -- Site collection discovery -----------------------------------------
 function Get-SiteCollections {
-    param([string]$WebApp, [hashtable]$Headers, [PSCredential]$Cred)
+    param([string]$WebApp, [PSCredential]$Cred)
 
     Write-Host "`nDiscovering site collections in: $WebApp" -ForegroundColor Cyan
 
@@ -130,87 +143,83 @@ function Get-SiteCollections {
            "&selectproperties='SPSiteUrl,Title'" +
            "&rowlimit=500&trimduplicates=false"
 
-    $result = Invoke-SpRestGet -Url $url -Headers $Headers -Cred $Cred
-    if (-not $result) { return @() }
+    $d = Invoke-SpRestGet -Url $url -Cred $Cred
+    if ($null -eq $d) { return @() }
 
-    # Force array — single result would otherwise be unwrapped by PowerShell
-    $rows = @($result.query.PrimaryQueryResult.RelevantResults.Table.Rows.results)
+    $rows = ConvertTo-Array $d.query.PrimaryQueryResult.RelevantResults.Table.Rows.results
     if ($rows.Count -eq 0) { return @() }
 
-    $sites = foreach ($row in $rows) {
-        $cells = @($row.Cells.results)
-        [PSCustomObject]@{
-            Url   = ($cells | Where-Object { $_.Key -eq 'SPSiteUrl' }).Value
-            Title = ($cells | Where-Object { $_.Key -eq 'Title' }).Value
+    $output = New-Object System.Collections.ArrayList
+    foreach ($row in $rows) {
+        $cells   = ConvertTo-Array $row.Cells.results
+        $urlVal  = ($cells | Where-Object { $_.Key -eq 'SPSiteUrl' } | Select-Object -First 1).Value
+        $titleVal= ($cells | Where-Object { $_.Key -eq 'Title'     } | Select-Object -First 1).Value
+        if ($urlVal) {
+            [void]$output.Add([PSCustomObject]@{ Url = $urlVal; Title = $titleVal })
         }
     }
-
-    # Always return a proper array
-    return @($sites)
+    return @($output)
 }
 #endregion
 
-#region -- Sub-site enumeration (BFS, always recursive) ----------------------
+#region -- Sub-site enumeration (BFS) ----------------------------------------
 function Get-AllWebs {
-    param([string]$SiteUrl, [hashtable]$Headers, [PSCredential]$Cred)
+    param([string]$SiteUrl, [PSCredential]$Cred)
 
-    $webs  = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $output = New-Object System.Collections.ArrayList
+    $queue  = New-Object System.Collections.Generic.Queue[string]
 
-    # Fetch root web info
-    $rootData = Invoke-SpRestGet -Url "$SiteUrl/_api/web?`$select=Url,Title" -Headers $Headers -Cred $Cred
-    if ($rootData) {
-        $webs.Add([PSCustomObject]@{ Url = [string]$rootData.Url; Title = [string]$rootData.Title })
-        $queue.Enqueue([string]$rootData.Url)
+    # Root web
+    $rootD = Invoke-SpRestGet -Url "$SiteUrl/_api/web?`$select=Url,Title" -Cred $Cred
+    if ($rootD) {
+        [void]$output.Add([PSCustomObject]@{ Url = [string]$rootD.Url; Title = [string]$rootD.Title })
+        $queue.Enqueue([string]$rootD.Url)
     } else {
-        $webs.Add([PSCustomObject]@{ Url = $SiteUrl; Title = $SiteUrl })
+        [void]$output.Add([PSCustomObject]@{ Url = $SiteUrl; Title = $SiteUrl })
         $queue.Enqueue($SiteUrl)
     }
 
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
-        $subData = Invoke-SpRestGet -Url "$current/_api/web/webs?`$select=Url,Title" -Headers $Headers -Cred $Cred
-        if (-not $subData) { continue }
+        $subD    = Invoke-SpRestGet -Url "$current/_api/web/webs?`$select=Url,Title" -Cred $Cred
+        if ($null -eq $subD) { continue }
 
-        # Force array so a single sub-site is still iterable
-        $subResults = @($subData.results)
-        foreach ($sub in $subResults) {
-            $webs.Add([PSCustomObject]@{ Url = [string]$sub.Url; Title = [string]$sub.Title })
+        $subs = ConvertTo-Array $subD.results
+        foreach ($sub in $subs) {
+            [void]$output.Add([PSCustomObject]@{ Url = [string]$sub.Url; Title = [string]$sub.Title })
             $queue.Enqueue([string]$sub.Url)
         }
     }
 
-    return $webs   # List<T> always has .Count — safe
+    return @($output)
 }
 #endregion
 
 #region -- Role assignments ---------------------------------------------------
 function Get-WebRoleAssignments {
-    param([string]$WebUrl, [hashtable]$Headers, [PSCredential]$Cred)
+    param([string]$WebUrl, [PSCredential]$Cred)
 
     $url = "$WebUrl/_api/web/roleassignments" +
            "?`$expand=Member,RoleDefinitionBindings" +
            "&`$select=Member/Id,Member/LoginName,Member/Email,Member/Title,Member/PrincipalType," +
                      "RoleDefinitionBindings/Name"
 
-    $data = Invoke-SpRestGet -Url $url -Headers $Headers -Cred $Cred
-    if (-not $data) { return @() }
-
-    # Force array — single role assignment would otherwise lose .results
-    return @($data.results)
+    $d = Invoke-SpRestGet -Url $url -Cred $Cred
+    if ($null -eq $d) { return @() }
+    return ConvertTo-Array $d.results
 }
 #endregion
 
 #region -- SharePoint group member expansion ---------------------------------
 function Get-GroupMembers {
-    param([string]$WebUrl, [int]$GroupId, [hashtable]$Headers, [PSCredential]$Cred)
+    param([string]$WebUrl, [int]$GroupId, [PSCredential]$Cred)
 
-    $data = Invoke-SpRestGet `
+    $d = Invoke-SpRestGet `
         -Url "$WebUrl/_api/web/sitegroups/getbyid($GroupId)/users?`$select=LoginName,Email,Title" `
-        -Headers $Headers -Cred $Cred
+        -Cred $Cred
 
-    if (-not $data) { return @() }
-    return @($data.results)   # force array
+    if ($null -eq $d) { return @() }
+    return ConvertTo-Array $d.results
 }
 #endregion
 
@@ -225,7 +234,6 @@ function ConvertTo-SafeFileName {
 #endregion
 
 #region -- Main ---------------------------------------------------------------
-$headers = New-RestHeaders
 
 # Ensure output folder exists
 if (-not (Test-Path $OutputFolder)) {
@@ -233,9 +241,9 @@ if (-not (Test-Path $OutputFolder)) {
     Write-Host "Created output folder: $OutputFolder" -ForegroundColor DarkGray
 }
 
-[array]$sites = Get-SiteCollections -WebApp $WebAppUrl -Headers $headers -Cred $Credential
+$sites = Get-SiteCollections -WebApp $WebAppUrl -Cred $Credential
 
-if ($sites.Count -eq 0) {
+if ($null -eq $sites -or $sites.Count -eq 0) {
     Write-Warning "No site collections found. Verify the Web Application URL and that the account has Full Read access."
     exit 1
 }
@@ -252,39 +260,37 @@ foreach ($site in $sites) {
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
     Write-Host "Site Collection : $($site.Url)" -ForegroundColor Yellow
 
-    $webs = Get-AllWebs -SiteUrl $site.Url -Headers $headers -Cred $Credential
+    $webs = Get-AllWebs -SiteUrl $site.Url -Cred $Credential
     Write-Host "Webs found      : $($webs.Count) (root + sub-sites)" -ForegroundColor DarkCyan
 
-    $siteRows = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $siteRows = New-Object System.Collections.ArrayList
 
     foreach ($web in $webs) {
         Write-Verbose "  Processing web: $($web.Url)"
 
-        [array]$assignments = Get-WebRoleAssignments -WebUrl $web.Url -Headers $headers -Cred $Credential
-        if ($assignments.Count -eq 0) { continue }
+        $assignments = Get-WebRoleAssignments -WebUrl $web.Url -Cred $Credential
+        if ($null -eq $assignments -or $assignments.Count -eq 0) { continue }
 
         foreach ($ra in $assignments) {
             $member        = $ra.Member
             $principalType = [int]$member.PrincipalType
 
-            # Build permission label — guard against empty bindings
-            [array]$bindingNames = @($ra.RoleDefinitionBindings.results) |
-                                   ForEach-Object { $_.Name } |
-                                   Where-Object { $_ }
-            $roles = $bindingNames -join '; '
+            $bindingResults = ConvertTo-Array $ra.RoleDefinitionBindings.results
+            $roles = ($bindingResults | ForEach-Object { $_.Name } | Where-Object { $_ }) -join '; '
 
             switch ($principalType) {
 
                 $PT_USER {
-                    if (Test-IsSystemAccount -LoginName ([string]$member.LoginName) `
-                                            -Email    ([string]$member.Email)) { break }
-                    $siteRows.Add([PSCustomObject]@{
+                    $login = [string]$member.LoginName
+                    $email = [string]$member.Email
+                    if (Test-IsSystemAccount -LoginName $login -Email $email) { break }
+                    [void]$siteRows.Add([PSCustomObject]@{
                         SiteCollectionUrl = $site.Url
                         WebUrl            = $web.Url
                         WebTitle          = $web.Title
-                        UserID            = $member.LoginName
-                        Email             = $member.Email
-                        DisplayName       = $member.Title
+                        UserID            = $login
+                        Email             = $email
+                        DisplayName       = [string]$member.Title
                         PermissionLevel   = $roles
                         SourceGroup       = ''
                     })
@@ -298,28 +304,28 @@ foreach ($site in $sites) {
                         elseif ($member.__metadata.id -match "getbyid\((\d+)\)") { $gid = [int]$Matches[1] }
                         if ($gid -eq 0) { break }
 
-                        [array]$members = Get-GroupMembers -WebUrl $web.Url -GroupId $gid `
-                                                           -Headers $headers -Cred $Credential
+                        $members = Get-GroupMembers -WebUrl $web.Url -GroupId $gid -Cred $Credential
                         foreach ($u in $members) {
-                            if (Test-IsSystemAccount -LoginName ([string]$u.LoginName) `
-                                                    -Email    ([string]$u.Email)) { continue }
-                            $siteRows.Add([PSCustomObject]@{
+                            $uLogin = [string]$u.LoginName
+                            $uEmail = [string]$u.Email
+                            if (Test-IsSystemAccount -LoginName $uLogin -Email $uEmail) { continue }
+                            [void]$siteRows.Add([PSCustomObject]@{
                                 SiteCollectionUrl = $site.Url
                                 WebUrl            = $web.Url
                                 WebTitle          = $web.Title
-                                UserID            = $u.LoginName
-                                Email             = $u.Email
-                                DisplayName       = $u.Title
+                                UserID            = $uLogin
+                                Email             = $uEmail
+                                DisplayName       = [string]$u.Title
                                 PermissionLevel   = $roles
-                                SourceGroup       = $member.Title
+                                SourceGroup       = [string]$member.Title
                             })
                         }
                     } else {
-                        $siteRows.Add([PSCustomObject]@{
+                        [void]$siteRows.Add([PSCustomObject]@{
                             SiteCollectionUrl = $site.Url
                             WebUrl            = $web.Url
                             WebTitle          = $web.Title
-                            UserID            = $member.LoginName
+                            UserID            = [string]$member.LoginName
                             Email             = ''
                             DisplayName       = "$($member.Title) [SP Group]"
                             PermissionLevel   = $roles
@@ -330,14 +336,15 @@ foreach ($site in $sites) {
                 }
 
                 $PT_ADGRP {
-                    if (Test-IsSystemAccount -LoginName ([string]$member.LoginName) `
-                                            -Email    ([string]$member.Email)) { break }
-                    $siteRows.Add([PSCustomObject]@{
+                    $login = [string]$member.LoginName
+                    $email = [string]$member.Email
+                    if (Test-IsSystemAccount -LoginName $login -Email $email) { break }
+                    [void]$siteRows.Add([PSCustomObject]@{
                         SiteCollectionUrl = $site.Url
                         WebUrl            = $web.Url
                         WebTitle          = $web.Title
-                        UserID            = $member.LoginName
-                        Email             = $member.Email
+                        UserID            = $login
+                        Email             = $email
                         DisplayName       = "$($member.Title) [AD Security Group]"
                         PermissionLevel   = $roles
                         SourceGroup       = ''
@@ -348,7 +355,7 @@ foreach ($site in $sites) {
         }
     }
 
-    # -- Write per-site-collection CSV ---------------------------------------
+    # Write per-site-collection CSV
     $safeName = ConvertTo-SafeFileName -Url $site.Url
     $csvPath  = Join-Path $OutputFolder "$safeName.csv"
 
@@ -369,6 +376,6 @@ foreach ($site in $sites) {
 }
 
 Write-Host "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor DarkGray
-Write-Host "All done. Total records across all sites: $grandTotal" -ForegroundColor Cyan
+Write-Host "All done. Total records: $grandTotal" -ForegroundColor Cyan
 Write-Host "Output folder: $(Resolve-Path $OutputFolder)" -ForegroundColor Cyan
 #endregion
